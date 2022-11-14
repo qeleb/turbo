@@ -19,12 +19,14 @@ use util::{
     build_test, create_browser, AsyncBencherExtension, PageGuard, PreparedApp, BINDING_NAME,
 };
 
-use self::util::resume_on_error;
+use self::{bundlers::RenderType, util::resume_on_error};
+use crate::bundlers::Bundler;
 
 mod bundlers;
 mod util;
 
 const MAX_UPDATE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_WARMUP_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn bench_startup(c: &mut Criterion) {
     let mut g = c.benchmark_group("bench_startup");
@@ -44,27 +46,30 @@ fn bench_hydration(c: &mut Criterion) {
 
 fn bench_startup_internal(mut g: BenchmarkGroup<WallTime>, hydration: bool) {
     let runtime = Runtime::new().unwrap();
-    let browser = &runtime.block_on(create_browser());
+    let browser = Lazy::new(|| runtime.block_on(create_browser()));
 
     for bundler in get_bundlers() {
-        let wait_for_hydration = if !bundler.has_server_rendered_html() {
-            // For bundlers without server rendered html "startup" means time to hydration
-            // as they only render an empty screen without hydration. Since startup and
-            // hydration would be the same we skip the hydration benchmark for them.
-            if hydration {
-                continue;
-            } else {
-                true
+        let wait_for_hydration = match bundler.render_type() {
+            RenderType::ClientSideRendered => {
+                // For bundlers without server rendered html "startup" means time to hydration
+                // as they only render an empty screen without hydration. Since startup and
+                // hydration would be the same we skip the hydration benchmark for them.
+                if hydration {
+                    continue;
+                } else {
+                    true
+                }
             }
-        } else if !bundler.has_interactivity() {
-            // For bundlers without interactivity there is no hydration event to wait for
-            if hydration {
-                continue;
-            } else {
-                false
+            RenderType::ServerSidePrerendered => hydration,
+            RenderType::ServerSideRenderedWithEvents => hydration,
+            RenderType::ServerSideRenderedWithoutInteractivity => {
+                // For bundlers without interactivity there is no hydration event to wait for
+                if hydration {
+                    continue;
+                } else {
+                    false
+                }
             }
-        } else {
-            hydration
         };
         for module_count in get_module_counts() {
             let test_app = Lazy::new(|| build_test(module_count, bundler.as_ref()));
@@ -74,6 +79,7 @@ fn bench_startup_internal(mut g: BenchmarkGroup<WallTime>, hydration: bool) {
                     BenchmarkId::new(bundler.get_name(), format!("{} modules", module_count)),
                     &input,
                     |b, &(bundler, test_app)| {
+                        let browser = &*browser;
                         b.to_async(&runtime).try_iter_async(
                             || async {
                                 PreparedApp::new(bundler, test_app.path().to_path_buf()).await
@@ -123,11 +129,17 @@ fn bench_hmr_to_commit(c: &mut Criterion) {
 
 fn bench_hmr_internal(mut g: BenchmarkGroup<WallTime>, location: CodeLocation) {
     let runtime = Runtime::new().unwrap();
-    let browser = &runtime.block_on(create_browser());
+    let browser = Lazy::new(|| runtime.block_on(create_browser()));
 
     for bundler in get_bundlers() {
-        // TODO HMR for RSC is broken, fix it and enable it here
-        if !bundler.has_interactivity() {
+        if matches!(
+            bundler.render_type(),
+            RenderType::ServerSideRenderedWithEvents
+                | RenderType::ServerSideRenderedWithoutInteractivity
+        ) && matches!(location, CodeLocation::Evaluation)
+        {
+            // We can't measure evaluation time for these bundlers since it's not evaluated
+            // in the browser
             continue;
         }
         for module_count in get_module_counts() {
@@ -138,35 +150,44 @@ fn bench_hmr_internal(mut g: BenchmarkGroup<WallTime>, location: CodeLocation) {
                     BenchmarkId::new(bundler.get_name(), format!("{} modules", module_count)),
                     &input,
                     |b, &(bundler, test_app)| {
+                        let browser = &*browser;
                         fn add_code(
+                            bundler: &dyn Bundler,
                             app_path: &Path,
-                            code: &str,
+                            msg: &str,
                             location: CodeLocation,
                         ) -> Result<()> {
                             let triangle_path = app_path.join("src/triangle.jsx");
                             let mut contents = fs::read_to_string(&triangle_path)?;
                             const INSERTED_CODE_COMMENT: &str = "// Inserted Code:\n";
                             const COMPONENT_START: &str = "function Container({ style }) {\n";
-                            match location {
-                                CodeLocation::Effect => {
+                            const DETECTOR_START: &str = "<Detector ";
+                            const DETECTOR_END: &str = "/>";
+                            match (location, bundler.render_type()) {
+                                (CodeLocation::Effect, _) => {
                                     let a = contents
-                                        .find(COMPONENT_START)
-                                        .ok_or_else(|| anyhow!("unable to find component start"))?;
-                                    let b = contents
-                                        .find("\n    return <>")
-                                        .ok_or_else(|| anyhow!("unable to find component start"))?;
+                                        .find(DETECTOR_START)
+                                        .ok_or_else(|| anyhow!("unable to find detector start"))?;
+                                    let b = a + contents[a..]
+                                        .find(DETECTOR_END)
+                                        .ok_or_else(|| anyhow!("unable to find detector end"))?;
                                     contents.replace_range(
                                         a..b,
-                                        &format!(
-                                            "{COMPONENT_START}    React.useEffect(() => {{ {code} \
-                                             }});\n"
-                                        ),
+                                        &format!("{DETECTOR_START}message=\"{msg}\" "),
                                     );
                                 }
-                                CodeLocation::Evaluation => {
+                                (
+                                    CodeLocation::Evaluation,
+                                    RenderType::ClientSideRendered
+                                    | RenderType::ServerSidePrerendered,
+                                ) => {
                                     let b = contents
                                         .find(COMPONENT_START)
                                         .ok_or_else(|| anyhow!("unable to find component start"))?;
+                                    let code = format!(
+                                        "globalThis.{BINDING_NAME} && \
+                                         globalThis.{BINDING_NAME}('{msg}');"
+                                    );
                                     if let Some(a) = contents.find(INSERTED_CODE_COMMENT) {
                                         contents.replace_range(
                                             a..b,
@@ -179,6 +200,16 @@ fn bench_hmr_internal(mut g: BenchmarkGroup<WallTime>, location: CodeLocation) {
                                         );
                                     }
                                 }
+                                (
+                                    CodeLocation::Evaluation,
+                                    RenderType::ServerSideRenderedWithEvents
+                                    | RenderType::ServerSideRenderedWithoutInteractivity,
+                                ) => {
+                                    panic!(
+                                        "evaluation can't be measured for bundlers which evaluate \
+                                         on server side"
+                                    );
+                                }
                             }
 
                             fs::write(&triangle_path, contents)?;
@@ -187,20 +218,14 @@ fn bench_hmr_internal(mut g: BenchmarkGroup<WallTime>, location: CodeLocation) {
                         static CHANGE_TIMEOUT_MESSAGE: &str =
                             "update was not registered by bundler";
                         async fn make_change<'a>(
+                            bundler: &dyn Bundler,
                             guard: &mut PageGuard<'a>,
                             location: CodeLocation,
                             timeout_duration: Duration,
                         ) -> Result<()> {
                             let msg =
                                 format!("TURBOPACK_BENCH_CHANGE_{}", guard.app_mut().counter());
-                            add_code(
-                                guard.app().path(),
-                                &format!(
-                                    "globalThis.{BINDING_NAME} && \
-                                     globalThis.{BINDING_NAME}('{msg}');"
-                                ),
-                                location,
-                            )?;
+                            add_code(bundler, guard.app().path(), &msg, location)?;
 
                             // Wait for the change introduced above to be reflected at runtime.
                             // This expects HMR or automatic reloading to occur.
@@ -217,7 +242,7 @@ fn bench_hmr_internal(mut g: BenchmarkGroup<WallTime>, location: CodeLocation) {
                                         .await?;
                                 app.start_server()?;
                                 let mut guard = app.with_page(browser).await?;
-                                if bundler.has_interactivity() {
+                                if bundler.has_hydration_event() {
                                     guard.wait_for_hydration().await?;
                                 } else {
                                     guard.page().wait_for_navigation().await?;
@@ -234,14 +259,23 @@ fn bench_hmr_internal(mut g: BenchmarkGroup<WallTime>, location: CodeLocation) {
                             },
                             |mut guard| async move {
                                 // Make 5 changes to warm up.
-                                for _ in 0..5 {
-                                    let _ =
-                                        make_change(&mut guard, location, MAX_UPDATE_TIMEOUT).await;
+                                for _ in 0..4 {
+                                    let _ = make_change(
+                                        bundler,
+                                        &mut guard,
+                                        location,
+                                        MAX_WARMUP_UPDATE_TIMEOUT,
+                                    )
+                                    .await;
                                 }
+                                let _ =
+                                    make_change(bundler, &mut guard, location, MAX_UPDATE_TIMEOUT)
+                                        .await;
                                 Ok(guard)
                             },
                             |mut guard| async move {
-                                make_change(&mut guard, location, MAX_UPDATE_TIMEOUT).await?;
+                                make_change(bundler, &mut guard, location, MAX_UPDATE_TIMEOUT)
+                                    .await?;
 
                                 // Defer the dropping of the guard to `teardown`.
                                 Ok(guard)
@@ -290,27 +324,30 @@ fn bench_startup_cached_internal(mut g: BenchmarkGroup<WallTime>, hydration: boo
     }
 
     let runtime = Runtime::new().unwrap();
-    let browser = &runtime.block_on(create_browser());
+    let browser = Lazy::new(|| runtime.block_on(create_browser()));
 
     for bundler in get_bundlers() {
-        let wait_for_hydration = if !bundler.has_server_rendered_html() {
-            // For bundlers without server rendered html "startup" means time to hydration
-            // as they only render an empty screen without hydration. Since startup and
-            // hydration would be the same we skip the hydration benchmark for them.
-            if hydration {
-                continue;
-            } else {
-                true
+        let wait_for_hydration = match bundler.render_type() {
+            RenderType::ClientSideRendered => {
+                // For bundlers without server rendered html "startup" means time to hydration
+                // as they only render an empty screen without hydration. Since startup and
+                // hydration would be the same we skip the hydration benchmark for them.
+                if hydration {
+                    continue;
+                } else {
+                    true
+                }
             }
-        } else if !bundler.has_interactivity() {
-            // For bundlers without interactivity there is no hydration event to wait for
-            if hydration {
-                continue;
-            } else {
-                false
+            RenderType::ServerSidePrerendered => hydration,
+            RenderType::ServerSideRenderedWithEvents => hydration,
+            RenderType::ServerSideRenderedWithoutInteractivity => {
+                // For bundlers without interactivity there is no hydration event to wait for
+                if hydration {
+                    continue;
+                } else {
+                    false
+                }
             }
-        } else {
-            hydration
         };
         for module_count in get_module_counts() {
             let test_app = Lazy::new(|| build_test(module_count, bundler.as_ref()));
@@ -321,6 +358,7 @@ fn bench_startup_cached_internal(mut g: BenchmarkGroup<WallTime>, hydration: boo
                     BenchmarkId::new(bundler.get_name(), format!("{} modules", module_count)),
                     &input,
                     |b, &(bundler, test_app)| {
+                        let browser = &*browser;
                         b.to_async(Runtime::new().unwrap()).try_iter_async(
                             || async {
                                 // Run a complete build, shut down, and test running it again
@@ -329,7 +367,7 @@ fn bench_startup_cached_internal(mut g: BenchmarkGroup<WallTime>, hydration: boo
                                         .await?;
                                 app.start_server()?;
                                 let mut guard = app.with_page(browser).await?;
-                                if bundler.has_interactivity() {
+                                if bundler.has_hydration_event() {
                                     guard.wait_for_hydration().await?;
                                 } else {
                                     guard.page().wait_for_navigation().await?;
