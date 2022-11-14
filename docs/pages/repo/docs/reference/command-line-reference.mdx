@@ -327,7 +327,12 @@ Will execute _only_ the `test` tasks in each workspace. It will not `build`.
 #### `--parallel`
 
 Default `false`. Run commands in parallel across workspaces and ignore the task dependency graph.
-Before you use this option, consider using the [`persistent`](#persistent) config instead.
+
+<Callout type="info">
+  The `--parallel` flag is typically used for "dev" or `--watch` mode tasks that don't exit.
+  Starting in `turbo@1.7`, we recommend configuring these tasks using the
+  [`persistent`](/repo/docs/reference/configuration#persistent) config instead.
+</Callout>
 
 ```sh
 turbo run lint --parallel --no-cache
